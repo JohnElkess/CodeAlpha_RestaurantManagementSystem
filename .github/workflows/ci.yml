@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Cache the MongoDB binary used by the tests
+        uses: actions/cache@v4
+        with:
+          path: node_modules/.cache/mongodb-memory-server
+          key: mongo-bin-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - run: npm ci
+      - run: npm test
+
+  docker:
+    needs: test # only when the tests pass
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env from the example file
+        run: cp .env.example .env
+
+      - name: Build and start the stack
+        run: docker compose up -d --build
+
+      - name: Wait for the API to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://localhost:3000/health; then echo; echo "API is up"; exit 0; fi
+            echo "waiting for API ($i/30)..."; sleep 2
+          done
+          echo "API did not become healthy"; exit 1
+
+      - name: Seed the database and smoke-test the real stack
+        run: |
+          docker compose exec -T api node src/seed/seed.js
+          test "$(curl -s http://localhost:3000/api/menu | jq '.items | length')" = "4"
+          TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"identifier":"+201000000000","password":"replace_me_min_8_chars"}' | jq -r .token)
+          test "$TOKEN" != "null"
+          test "$(curl -s -H "Authorization: Bearer $TOKEN" http://localhost:3000/api/ingredients | jq '.items | length')" -ge 13
+
+      - name: Show API logs on failure
+        if: failure()
+        run: docker compose logs api
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
